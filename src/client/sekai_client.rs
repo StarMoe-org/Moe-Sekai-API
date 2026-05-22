@@ -1303,41 +1303,6 @@ impl SekaiClient {
             .map_err(|e| AppError::ParseError(format!("failed to decode base64: {}", e)))?;
         Ok(bytes)
     }
-
-    pub async fn get_nuverse_mysekai_housing_thumbnail(
-        &self,
-        path: &str,
-    ) -> Result<(Vec<u8>, String), AppError> {
-        let path_clean = path.trim_start_matches('/');
-        let image_url = format!(
-            "https://mk-prod-tos.tos-cn-shanghai.volces.com/image/mysekai-housing-competition/thumbnail/{}",
-            path_clean
-        );
-        let resp = self
-            .http_client
-            .get(&image_url)
-            .send()
-            .await
-            .map_err(|e| AppError::NetworkError(e.to_string()))?;
-        let status = resp.status().as_u16();
-        if status != 200 {
-            return Err(AppError::Unknown {
-                status,
-                body: format!("Failed to fetch image from {}", image_url),
-            });
-        }
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("application/octet-stream")
-            .to_string();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| AppError::NetworkError(e.to_string()))?;
-        Ok((bytes.to_vec(), content_type))
-    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]

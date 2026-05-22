@@ -99,10 +99,10 @@ pub async fn get_mysekai_housing_thumbnail(
                 .into_response();
         }
     };
-    if !region.is_cp_server() && region != ServerRegion::Cn {
+    if !region.is_cp_server() {
         return (
             StatusCode::BAD_REQUEST,
-            "mysekai housing thumbnail is only supported on jp/en/cn servers",
+            "mysekai housing thumbnail is only supported on colorful palette servers (jp/en)",
         )
             .into_response();
     }
@@ -123,12 +123,7 @@ pub async fn get_mysekai_housing_thumbnail(
             .into_response();
     }
     let combined = format!("{}/{}", hash1, hash2);
-    let result = if region.is_cp_server() {
-        client.get_cp_mysekai_housing_thumbnail(&combined).await
-    } else {
-        client.get_nuverse_mysekai_housing_thumbnail(&combined).await
-    };
-    match result {
+    match client.get_cp_mysekai_housing_thumbnail(&combined).await {
         Ok((bytes, content_type)) => {
             let ct = sniff_image_content_type(&content_type, &bytes);
             (StatusCode::OK, [("content-type", ct)], bytes).into_response()
