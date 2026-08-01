@@ -112,6 +112,17 @@ docker run -d \
 
 未配置 `proxyRoles` 的账号默认只用于普通接口。`/mysekai/` 相关路由会使用 `proxyRoles` 包含 `mysekai` 的账号代理，例如 `POST /api/{server}/user/mysekai/housing-competition/{housing_id}/mysekai-owner/{owner_user_id}/entry`。
 
+上游 HTTP 代理可以在顶层 `proxy` 中设置为所有服务器的默认值，也可以在 `servers.<region>.proxy` 中按服务器单独设置。服务器级配置优先于顶层配置；省略服务器级字段表示继承顶层代理，显式配置为空字符串表示该服务器直连。例如：
+
+```yaml
+proxy: ""
+servers:
+  tw:
+    proxy: "http://moe-upstream-proxy:7890"
+  kr:
+    proxy: "http://moe-upstream-proxy:7890"
+```
+
 ## 目录建议
 
 建议将运行时数据与源码分离。一个常见布局如下：

@@ -67,6 +67,8 @@ servers:
     app_hash_updater_cron: "30 * * * * *"
     # Leave empty to use built-in Team-Haruki URL for this region
     remote_version_url: ""
+    # Omit to inherit the global proxy; set an empty value to force direct access.
+    # proxy: "http://proxy.example:7890"
 
   cn:
     enabled: false
@@ -97,6 +99,7 @@ servers:
     enable_app_hash_updater: false
     app_hash_updater_cron: "30 * * * * *"
     remote_version_url: ""
+    # proxy: "http://proxy.example:7890"
 
   en:
     enabled: false
@@ -116,6 +119,7 @@ servers:
     enable_app_hash_updater: false
     app_hash_updater_cron: "30 * * * * *"
     remote_version_url: ""
+    # proxy: "http://proxy.example:7890"
 
   tw:
     enabled: false
@@ -135,6 +139,8 @@ servers:
     enable_app_hash_updater: false
     app_hash_updater_cron: "30 * * * * *"
     remote_version_url: ""
+    # Use an HTTP(S) proxy for this region when its direct egress is rejected.
+    # proxy: "http://proxy.example:7890"
 
   kr:
     enabled: false
@@ -154,3 +160,5 @@ servers:
     enable_app_hash_updater: false
     app_hash_updater_cron: "30 * * * * *"
     remote_version_url: ""
+    # Use an HTTP(S) proxy for this region when its direct egress is rejected.
+    # proxy: "http://proxy.example:7890"

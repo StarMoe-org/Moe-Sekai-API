@@ -156,6 +156,26 @@ pub struct ServerConfig {
     pub app_hash_updater_cron: String,
     #[serde(default)]
     pub remote_version_url: String,
+    /// Per-server upstream HTTP(S) proxy. When omitted, the global `proxy`
+    /// value is inherited; an explicit empty value disables proxying for this
+    /// server.
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+impl ServerConfig {
+    pub fn resolve_proxy(&self, global_proxy: &str) -> Option<String> {
+        resolve_proxy_value(self.proxy.as_deref(), global_proxy)
+    }
+}
+
+fn resolve_proxy_value(server_proxy: Option<&str>, global_proxy: &str) -> Option<String> {
+    match server_proxy {
+        Some(proxy) if !proxy.trim().is_empty() => Some(proxy.to_string()),
+        Some(_) => None,
+        None if !global_proxy.trim().is_empty() => Some(global_proxy.to_string()),
+        None => None,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -239,5 +259,31 @@ impl Config {
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_proxy_value;
+
+    #[test]
+    fn omitted_server_proxy_inherits_global_proxy() {
+        assert_eq!(
+            resolve_proxy_value(None, "http://proxy.internal:7890"),
+            Some("http://proxy.internal:7890".to_string())
+        );
+    }
+
+    #[test]
+    fn server_proxy_overrides_global_proxy() {
+        assert_eq!(
+            resolve_proxy_value(Some("http://tw-proxy.internal:7890"), "http://global:7890"),
+            Some("http://tw-proxy.internal:7890".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_empty_server_proxy_disables_global_proxy() {
+        assert_eq!(resolve_proxy_value(Some("  "), "http://global:7890"), None);
     }
 }

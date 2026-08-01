@@ -17,11 +17,6 @@ pub async fn start_scheduler(
 ) -> Result<JobScheduler, JobSchedulerError> {
     let sched = JobScheduler::new().await?;
     let git_config = &config.git;
-    let proxy = if config.proxy.is_empty() {
-        None
-    } else {
-        Some(config.proxy.clone())
-    };
     for (region, client) in clients {
         if client.config.require_cookies && client.cookie_helper.is_some() {
             let region_name = region.as_str().to_uppercase();
@@ -69,6 +64,7 @@ pub async fn start_scheduler(
 
     for (region, client) in clients {
         let server_config = &client.config;
+        let proxy = server_config.resolve_proxy(&config.proxy);
         if server_config.enable_master_updater && !server_config.master_updater_cron.is_empty() {
             let region_name = region.as_str().to_uppercase();
             let cron_expr = server_config.master_updater_cron.clone();

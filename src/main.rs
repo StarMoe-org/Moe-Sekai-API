@@ -105,15 +105,17 @@ async fn init_app_state(config: Config) -> anyhow::Result<AppState> {
         if server_config.enabled {
             let region = *region;
             let server_config = server_config.clone();
-            let proxy = if config.proxy.is_empty() {
-                None
-            } else {
-                Some(config.proxy.clone())
-            };
+            let proxy = server_config.resolve_proxy(&config.proxy);
             let jp_cookie_url = jp_cookie_url.clone();
 
             init_tasks.push(tokio::spawn(async move {
                 info!("Initializing {} server...", region.as_str().to_uppercase());
+                if proxy.is_some() {
+                    info!(
+                        "{} Upstream HTTP proxy enabled",
+                        region.as_str().to_uppercase()
+                    );
+                }
                 let client = SekaiClient::new(region, server_config, proxy, jp_cookie_url).await?;
                 client.init().await?;
                 Ok::<_, AppError>((region, Arc::new(client)))
