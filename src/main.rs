@@ -131,6 +131,7 @@ async fn init_app_state(config: Config) -> anyhow::Result<AppState> {
                         e
                     );
                 }
+                client.start_empty_pool_recovery();
                 clients.insert(region, client);
             }
             Ok(Err(e)) => {

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,7 +38,79 @@ pub struct SekaiClient {
 
     sessions: Arc<RwLock<Vec<Arc<AccountSession>>>>,
     session_index: AtomicUsize,
-    reload_in_progress: Arc<std::sync::atomic::AtomicBool>,
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
+    recovery_started: Arc<AtomicBool>,
+}
+
+struct RecoveryFlagGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for RecoveryFlagGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SessionPoolReplacement {
+    EmptyCandidate { active: usize },
+    Replaced { active: usize },
+}
+
+struct ParsedAccounts {
+    accounts: Vec<AccountType>,
+    complete: bool,
+}
+
+const INITIAL_RECOVERY_DELAY: Duration = Duration::from_secs(5);
+const MAX_RECOVERY_DELAY: Duration = Duration::from_secs(300);
+
+fn next_recovery_delay(current: Duration) -> Duration {
+    current.saturating_mul(2).min(MAX_RECOVERY_DELAY)
+}
+
+fn try_claim_recovery(flag: &AtomicBool) -> bool {
+    flag.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+}
+
+fn should_wait_for_complete_parse(parse_complete: bool) -> bool {
+    !parse_complete
+}
+
+fn is_account_change_event(event: &Result<notify::Event, notify::Error>, region: &str) -> bool {
+    use notify::EventKind;
+
+    match event {
+        Ok(event) => matches!(
+            event.kind,
+            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+        ),
+        Err(e) => {
+            error!("{} File watcher error: {}", region, e);
+            false
+        }
+    }
+}
+
+fn replace_session_pool(
+    sessions: &RwLock<Vec<Arc<AccountSession>>>,
+    session_index: &AtomicUsize,
+    new_sessions: Vec<Arc<AccountSession>>,
+) -> SessionPoolReplacement {
+    if new_sessions.is_empty() {
+        return SessionPoolReplacement::EmptyCandidate {
+            active: sessions.read().len(),
+        };
+    }
+
+    let mut active_sessions = sessions.write();
+    *active_sessions = new_sessions;
+    session_index.store(0, Ordering::SeqCst);
+    SessionPoolReplacement::Replaced {
+        active: active_sessions.len(),
+    }
 }
 
 impl SekaiClient {
@@ -89,7 +161,8 @@ impl SekaiClient {
             http_client,
             sessions: Arc::new(RwLock::new(Vec::new())),
             session_index: AtomicUsize::new(0),
-            reload_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            recovery_started: Arc::new(AtomicBool::new(false)),
         };
         Ok(client)
     }
@@ -105,15 +178,17 @@ impl SekaiClient {
         }
         let version = self.version_helper.load().await?;
         self.update_version_headers(&version);
-        let accounts = self.parse_accounts()?;
-        if accounts.is_empty() {
-            warn!(
-                "{} No accounts found in {}",
-                self.region.as_str().to_uppercase(),
-                self.config.account_dir
-            );
-            return Ok(());
-        }
+        self.reload_accounts().await?;
+        info!(
+            "{} Client initialized with {} sessions",
+            self.region.as_str().to_uppercase(),
+            self.sessions.read().len()
+        );
+        Ok(())
+    }
+
+    async fn build_session_pool(&self, accounts: Vec<AccountType>) -> Vec<Arc<AccountSession>> {
+        let mut sessions = Vec::new();
         let mut upgrade_refreshed = false;
         for account in accounts {
             if self.region.is_cp_server() && account.user_id().is_empty() {
@@ -126,12 +201,12 @@ impl SekaiClient {
             let session = Arc::new(AccountSession::new(account));
             match self.login(&session).await {
                 Ok(_) => {
-                    self.sessions.write().push(session);
+                    sessions.push(session);
                 }
                 Err(AppError::UpgradeRequired) if !upgrade_refreshed => {
                     upgrade_refreshed = true;
                     warn!(
-                        "{} Login returned 426 during init, refreshing version...",
+                        "{} Login returned 426 during account reload, refreshing version...",
                         self.region.as_str().to_uppercase()
                     );
                     if let Err(e) = self.refresh_version_from_remote().await {
@@ -145,7 +220,7 @@ impl SekaiClient {
                     match self.login(&session).await {
                         Ok(login_resp) => {
                             self.update_version_headers_from_login(&login_resp);
-                            self.sessions.write().push(session);
+                            sessions.push(session);
                         }
                         Err(AppError::UpgradeRequired) => {
                             warn!(
@@ -164,7 +239,7 @@ impl SekaiClient {
                             match self.login(&session).await {
                                 Ok(login_resp) => {
                                     self.update_version_headers_from_login(&login_resp);
-                                    self.sessions.write().push(session);
+                                    sessions.push(session);
                                 }
                                 Err(e) => {
                                     error!(
@@ -193,12 +268,7 @@ impl SekaiClient {
                 }
             }
         }
-        info!(
-            "{} Client initialized with {} sessions",
-            self.region.as_str().to_uppercase(),
-            self.sessions.read().len()
-        );
-        Ok(())
+        sessions
     }
 
     fn update_version_headers(&self, version: &VersionInfo) {
@@ -291,104 +361,115 @@ impl SekaiClient {
     }
 
     pub async fn reload_accounts(&self) -> Result<(), AppError> {
+        let _reload_guard = self.reload_lock.lock().await;
+        self.reload_accounts_locked().await
+    }
+
+    async fn reload_accounts_locked(&self) -> Result<(), AppError> {
         info!(
             "{} Reloading accounts...",
             self.region.as_str().to_uppercase()
         );
-        self.reload_in_progress.store(true, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        {
-            let mut sessions = self.sessions.write();
-            sessions.clear();
-            self.session_index.store(0, Ordering::SeqCst);
-        }
-        let accounts = self.parse_accounts()?;
-        let mut upgrade_refreshed = false;
-        for account in accounts {
-            if self.region.is_cp_server() && account.user_id().is_empty() {
+
+        let parsed = match self.parse_accounts() {
+            Ok(parsed) => parsed,
+            Err(e) => {
                 warn!(
-                    "{} Skipping account with empty user_id",
-                    self.region.as_str().to_uppercase()
+                    "{} Failed to parse accounts, keeping {} active sessions: {}",
+                    self.region.as_str().to_uppercase(),
+                    self.session_count(),
+                    e
                 );
-                continue;
+                return Ok(());
             }
-            let session = Arc::new(AccountSession::new(account));
-            match self.login(&session).await {
-                Ok(_) => {
-                    self.sessions.write().push(session);
+        };
+        if parsed.accounts.is_empty() {
+            warn!(
+                "{} No accounts found in {}, keeping {} active sessions",
+                self.region.as_str().to_uppercase(),
+                self.config.account_dir,
+                self.session_count()
+            );
+            return Ok(());
+        }
+        if should_wait_for_complete_parse(parsed.complete) {
+            warn!(
+                "{} Account files were only partially parsed, keeping {} active sessions",
+                self.region.as_str().to_uppercase(),
+                self.session_count()
+            );
+            return Ok(());
+        }
+
+        let new_sessions = self.build_session_pool(parsed.accounts).await;
+        match replace_session_pool(&self.sessions, &self.session_index, new_sessions) {
+            SessionPoolReplacement::EmptyCandidate { active } => {
+                warn!(
+                    "{} No accounts logged in successfully, keeping {} active sessions",
+                    self.region.as_str().to_uppercase(),
+                    active
+                );
+            }
+            SessionPoolReplacement::Replaced { active } => {
+                info!(
+                    "{} Accounts reloaded, {} sessions active",
+                    self.region.as_str().to_uppercase(),
+                    active
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.sessions.read().len()
+    }
+
+    pub fn start_empty_pool_recovery(self: &Arc<Self>) {
+        if self.session_count() > 0 || !try_claim_recovery(&self.recovery_started) {
+            return;
+        }
+
+        let client = self.clone();
+        let flag_guard = RecoveryFlagGuard {
+            flag: self.recovery_started.clone(),
+        };
+        tokio::spawn(async move {
+            let _flag_guard = flag_guard;
+            let mut delay = INITIAL_RECOVERY_DELAY;
+            loop {
+                tokio::time::sleep(delay).await;
+                if client.session_count() > 0 {
+                    return;
                 }
-                Err(AppError::UpgradeRequired) if !upgrade_refreshed => {
-                    upgrade_refreshed = true;
-                    warn!(
-                        "{} Login returned 426 during reload, refreshing version...",
-                        self.region.as_str().to_uppercase()
-                    );
-                    if let Err(e) = self.refresh_version_from_remote().await {
+
+                warn!(
+                    "{} Session pool is empty, retrying account login",
+                    client.region.as_str().to_uppercase()
+                );
+                {
+                    let _reload_guard = client.reload_lock.lock().await;
+                    if client.session_count() > 0 {
+                        return;
+                    }
+                    if let Err(e) = client.reload_accounts_locked().await {
                         error!(
-                            "{} Failed to refresh version: {}",
-                            self.region.as_str().to_uppercase(),
+                            "{} Empty session pool recovery failed: {}",
+                            client.region.as_str().to_uppercase(),
                             e
                         );
-                        continue;
-                    }
-                    match self.login(&session).await {
-                        Ok(login_resp) => {
-                            self.update_version_headers_from_login(&login_resp);
-                            self.sessions.write().push(session);
-                        }
-                        Err(AppError::UpgradeRequired) => {
-                            warn!(
-                                "{} Still 426 after version refresh, waiting for app version update...",
-                                self.region.as_str().to_uppercase()
-                            );
-                            tokio::time::sleep(Duration::from_secs(10)).await;
-                            if let Err(e) = self.refresh_version_from_remote().await {
-                                error!(
-                                    "{} Failed to refresh version after wait: {}",
-                                    self.region.as_str().to_uppercase(),
-                                    e
-                                );
-                                continue;
-                            }
-                            match self.login(&session).await {
-                                Ok(login_resp) => {
-                                    self.update_version_headers_from_login(&login_resp);
-                                    self.sessions.write().push(session);
-                                }
-                                Err(e) => {
-                                    error!(
-                                        "{} Login failed after waiting for app update: {}",
-                                        self.region.as_str().to_uppercase(),
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                "{} Re-login after version refresh failed: {}",
-                                self.region.as_str().to_uppercase(),
-                                e
-                            );
-                        }
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "{} Failed to login account: {}",
-                        self.region.as_str().to_uppercase(),
-                        e
+                if client.session_count() > 0 {
+                    info!(
+                        "{} Session pool recovered successfully",
+                        client.region.as_str().to_uppercase()
                     );
+                    return;
                 }
+                delay = next_recovery_delay(delay);
             }
-        }
-        self.reload_in_progress.store(false, Ordering::SeqCst);
-        info!(
-            "{} Accounts reloaded, {} sessions active",
-            self.region.as_str().to_uppercase(),
-            self.sessions.read().len()
-        );
-        Ok(())
+        });
     }
 
     pub fn start_file_watcher(self: Arc<Self>) -> Result<(), AppError> {
@@ -423,55 +504,71 @@ impl SekaiClient {
                 .enable_all()
                 .build()
                 .expect("Failed to create tokio runtime for file watcher");
-            let mut last_reload = std::time::Instant::now();
-            let debounce_duration = Duration::from_secs(2);
-            for res in rx {
-                match res {
-                    Ok(event) => {
-                        use notify::EventKind;
-                        match event.kind {
-                            EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                                if last_reload.elapsed() < debounce_duration {
-                                    debug!(
-                                        "{} Skipping reload (debounce), last reload was {:?} ago",
-                                        region_str,
-                                        last_reload.elapsed()
-                                    );
-                                    continue;
-                                }
-                                info!(
-                                    "{} Account file change detected: {:?}",
-                                    region_str, event.paths
-                                );
-                                last_reload = std::time::Instant::now();
-                                let client_clone = client.clone();
-                                rt.block_on(async {
-                                    if let Err(e) = client_clone.reload_accounts().await {
-                                        error!("{} Failed to reload accounts: {}", region_str, e);
-                                    }
-                                });
-                            }
-                            _ => {}
-                        }
+            // Wait longer than one poll interval so a file write spanning polls is stable.
+            let settle_duration = Duration::from_secs(6);
+            while let Ok(res) = rx.recv() {
+                if !is_account_change_event(&res, &region_str) {
+                    continue;
+                }
+
+                let mut changed_paths = match res {
+                    Ok(event) => event.paths,
+                    Err(_) => Vec::new(),
+                };
+                let mut quiet_deadline = std::time::Instant::now() + settle_duration;
+                loop {
+                    let remaining =
+                        quiet_deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
                     }
-                    Err(e) => {
-                        error!("{} File watcher error: {}", region_str, e);
+                    match rx.recv_timeout(remaining) {
+                        Ok(next) => {
+                            if is_account_change_event(&next, &region_str) {
+                                if let Ok(event) = next {
+                                    changed_paths.extend(event.paths);
+                                    quiet_deadline = std::time::Instant::now() + settle_duration;
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     }
                 }
+
+                info!(
+                    "{} Account files settled after changes: {:?}",
+                    region_str, changed_paths
+                );
+                let client_clone = client.clone();
+                rt.block_on(async {
+                    if let Err(e) = client_clone.reload_accounts().await {
+                        error!("{} Failed to reload accounts: {}", region_str, e);
+                    }
+                });
             }
         });
         Ok(())
     }
 
-    fn parse_accounts(&self) -> Result<Vec<AccountType>, AppError> {
+    fn parse_accounts(&self) -> Result<ParsedAccounts, AppError> {
         let mut accounts = Vec::new();
+        let mut complete = true;
         let account_dir = Path::new(&self.config.account_dir);
         if !account_dir.exists() {
-            return Ok(accounts);
+            return Ok(ParsedAccounts { accounts, complete });
         }
         let entries = fs::read_dir(account_dir)
             .map_err(|e| AppError::ParseError(format!("Failed to read account dir: {}", e)))?;
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) => {
+                    warn!("Failed to read account directory entry: {}", e);
+                    complete = false;
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
@@ -480,39 +577,53 @@ impl SekaiClient {
                 Ok(d) => d,
                 Err(e) => {
                     warn!("Failed to read {}: {}", path.display(), e);
+                    complete = false;
                     continue;
                 }
             };
             match self.parse_account_file(&path, &data) {
-                Ok(mut accs) => accounts.append(&mut accs),
+                Ok((mut parsed, file_complete)) => {
+                    accounts.append(&mut parsed);
+                    complete &= file_complete;
+                }
                 Err(e) => {
                     warn!("Failed to parse {}: {}", path.display(), e);
+                    complete = false;
                 }
             }
         }
-        Ok(accounts)
+        Ok(ParsedAccounts { accounts, complete })
     }
 
-    fn parse_account_file(&self, path: &Path, data: &[u8]) -> Result<Vec<AccountType>, AppError> {
+    fn parse_account_file(
+        &self,
+        path: &Path,
+        data: &[u8],
+    ) -> Result<(Vec<AccountType>, bool), AppError> {
         let value: serde_json::Value = sonic_rs::from_slice(data)
             .map_err(|e| AppError::ParseError(format!("JSON parse error: {}", e)))?;
         let mut accounts = Vec::new();
+        let mut complete = true;
         match value {
             serde_json::Value::Array(arr) => {
                 for (idx, item) in arr.into_iter().enumerate() {
                     if let Some(acc) = self.parse_account_value(item, path, Some(idx)) {
                         accounts.push(acc);
+                    } else {
+                        complete = false;
                     }
                 }
             }
             serde_json::Value::Object(_) => {
                 if let Some(acc) = self.parse_account_value(value, path, None) {
                     accounts.push(acc);
+                } else {
+                    complete = false;
                 }
             }
-            _ => {}
+            _ => complete = false,
         }
-        Ok(accounts)
+        Ok((accounts, complete))
     }
 
     fn parse_account_value(
@@ -1057,9 +1168,6 @@ impl SekaiClient {
         params: Option<&HashMap<String, String>>,
         role: &str,
     ) -> Result<(JsonValue, u16), AppError> {
-        while self.reload_in_progress.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
         let session = self.get_session_for_role(role)?;
         let max_retries = 4;
         let mut retry_count = 0;
@@ -1336,10 +1444,28 @@ pub struct UserRegistration {
 
 #[cfg(test)]
 mod tests {
-    use super::SekaiClient;
+    use super::{
+        next_recovery_delay, replace_session_pool, should_wait_for_complete_parse,
+        try_claim_recovery, RecoveryFlagGuard, SekaiClient, SessionPoolReplacement,
+        INITIAL_RECOVERY_DELAY, MAX_RECOVERY_DELAY,
+    };
+    use crate::client::account::{AccountType, SekaiAccountCP, DEFAULT_PROXY_ROLE};
+    use crate::client::session::AccountSession;
     use base64::Engine as _;
     use flate2::{write::GzEncoder, Compression};
+    use parking_lot::RwLock;
     use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn session(user_id: &str, roles: &[&str]) -> Arc<AccountSession> {
+        Arc::new(AccountSession::new(AccountType::CP(SekaiAccountCP {
+            user_id: user_id.to_string(),
+            device_id: "device".to_string(),
+            credential: "credential".to_string(),
+            proxy_roles: roles.iter().map(|role| (*role).to_string()).collect(),
+        })))
+    }
 
     #[test]
     fn decode_custom_music_score_blob_text_decodes_base64_gzip_json() {
@@ -1354,5 +1480,84 @@ mod tests {
 
         assert_eq!(decoded["MusicId"], 121);
         assert_eq!(decoded["NoteList"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn empty_candidate_keeps_active_session_pool() {
+        let sessions = RwLock::new(vec![session("old", &[DEFAULT_PROXY_ROLE])]);
+        let index = AtomicUsize::new(7);
+
+        let result = replace_session_pool(&sessions, &index, Vec::new());
+
+        assert_eq!(result, SessionPoolReplacement::EmptyCandidate { active: 1 });
+        assert_eq!(sessions.read()[0].user_id(), "old");
+        assert_eq!(index.load(Ordering::SeqCst), 7);
+    }
+
+    #[test]
+    fn replacing_session_pool_resets_round_robin_index() {
+        let sessions = RwLock::new(vec![session("old", &[DEFAULT_PROXY_ROLE])]);
+        let index = AtomicUsize::new(7);
+
+        let result = replace_session_pool(
+            &sessions,
+            &index,
+            vec![session("new", &[DEFAULT_PROXY_ROLE])],
+        );
+
+        assert_eq!(result, SessionPoolReplacement::Replaced { active: 1 });
+        assert_eq!(sessions.read()[0].user_id(), "new");
+        assert_eq!(index.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn partial_success_candidate_replaces_old_session_pool() {
+        let sessions = RwLock::new(vec![
+            session("old-1", &[DEFAULT_PROXY_ROLE]),
+            session("old-2", &[DEFAULT_PROXY_ROLE]),
+        ]);
+        let index = AtomicUsize::new(7);
+
+        let result = replace_session_pool(
+            &sessions,
+            &index,
+            vec![session("new", &[DEFAULT_PROXY_ROLE])],
+        );
+
+        assert_eq!(result, SessionPoolReplacement::Replaced { active: 1 });
+        assert_eq!(sessions.read()[0].user_id(), "new");
+        assert_eq!(index.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn incomplete_parse_never_replaces_session_pool() {
+        assert!(should_wait_for_complete_parse(false));
+        assert!(!should_wait_for_complete_parse(true));
+    }
+
+    #[test]
+    fn recovery_backoff_caps_at_maximum_delay() {
+        assert_eq!(
+            next_recovery_delay(INITIAL_RECOVERY_DELAY),
+            INITIAL_RECOVERY_DELAY * 2
+        );
+        assert_eq!(next_recovery_delay(MAX_RECOVERY_DELAY), MAX_RECOVERY_DELAY);
+    }
+
+    #[test]
+    fn recovery_flag_guard_resets_flag_when_dropped() {
+        let flag = Arc::new(AtomicBool::new(true));
+
+        drop(RecoveryFlagGuard { flag: flag.clone() });
+
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn recovery_claim_allows_only_one_worker() {
+        let flag = AtomicBool::new(false);
+
+        assert!(try_claim_recovery(&flag));
+        assert!(!try_claim_recovery(&flag));
     }
 }
