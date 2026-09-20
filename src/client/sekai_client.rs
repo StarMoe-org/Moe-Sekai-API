@@ -1049,7 +1049,7 @@ impl SekaiClient {
     }
 
     pub async fn login(&self, session: &AccountSession) -> Result<LoginResponse, AppError> {
-        let payload = session.dump_account()?;
+        let payload = session.dump_account(self.config.login_protocol)?;
         let encrypted = self.cryptor.pack_bytes(&payload)?;
         let (url, method) = if self.region.is_cp_server() {
             let url = format!(

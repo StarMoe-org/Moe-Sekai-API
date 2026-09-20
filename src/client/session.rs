@@ -44,7 +44,10 @@ impl AccountSession {
         *self.session_token.lock() = token;
     }
 
-    pub fn dump_account(&self) -> Result<Vec<u8>, crate::error::AppError> {
-        self.account.lock().dump()
+    pub fn dump_account(
+        &self,
+        protocol: crate::config::LoginProtocol,
+    ) -> Result<Vec<u8>, crate::error::AppError> {
+        self.account.lock().dump(protocol)
     }
 }

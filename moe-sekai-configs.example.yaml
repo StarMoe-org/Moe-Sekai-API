@@ -87,8 +87,17 @@ servers:
       X-DeviceModel: "<replace-if-needed>"
       X-OperatingSystem: "<replace-if-needed>"
       X-Unity-Version: "<replace-if-needed>"
-    aes_key_hex: ""
-    aes_iv_hex: ""
+    # Game version bumps rotate the AES key/iv: extract the pair for your build
+    # from the client metadata. The 6.0.0 pair (g2fcC0ZczN9MTJ61 /
+    # msx3IV0i9XE5uYZ1) is no longer valid for game APIs -- it was demoted to
+    # the AssetBundle-only key in 6.4.0.
+    aes_key_hex: "<replace-if-needed>"
+    aes_iv_hex: "<replace-if-needed>"
+    # Login request body format. Omit for the legacy shape (deviceId/
+    # authTriggerType/userID, where the region supports it); set "v2" for the
+    # 6.4.0 shape, which carries only accessToken. This is per server, because
+    # regions do not all migrate on the same schedule.
+    # login_protocol: "v2"
     account_dir: "./runtime/accounts/cn"
     master_dir: "./runtime/master/cn"
     version_path: "./runtime/versions/cn.json"

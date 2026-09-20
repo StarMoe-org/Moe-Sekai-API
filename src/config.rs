@@ -122,6 +122,21 @@ pub struct GitConfig {
     pub password: String,
 }
 
+/// Login request body format spoken by the upstream game server.
+///
+/// - `V1`: legacy body, e.g. `{deviceId, accessToken, userID}` for Nuverse.
+/// - `V2`: 6.4.0 body, which carries only `{accessToken}`.
+///
+/// The upstream protocol changes per game version, and not every region moves at
+/// the same time, so this is configured per server instead of hardcoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoginProtocol {
+    #[default]
+    V1,
+    V2,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     #[serde(default)]
@@ -161,6 +176,11 @@ pub struct ServerConfig {
     /// server.
     #[serde(default)]
     pub proxy: Option<String>,
+    /// Which login request body format the upstream server expects. Defaults to
+    /// `v1` so existing regions keep working; set `v2` for servers that have
+    /// moved to the 6.4.0 protocol.
+    #[serde(default)]
+    pub login_protocol: LoginProtocol,
 }
 
 impl ServerConfig {

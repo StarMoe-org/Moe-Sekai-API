@@ -1,5 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::config::LoginProtocol;
 use crate::error::AppError;
 
 pub const DEFAULT_PROXY_ROLE: &str = "default";
@@ -38,7 +39,7 @@ pub trait SekaiAccount: Send + Sync {
     fn device_id(&self) -> &str;
     fn token(&self) -> &str;
     fn proxy_roles(&self) -> &[String];
-    fn dump(&self) -> Result<Vec<u8>, AppError>;
+    fn dump(&self, protocol: LoginProtocol) -> Result<Vec<u8>, AppError>;
 
     fn has_proxy_role(&self, role: &str) -> bool {
         normalized_proxy_roles(self.proxy_roles())
@@ -104,9 +105,9 @@ impl SekaiAccount for SekaiAccountCP {
         &self.proxy_roles
     }
 
-    fn dump(&self) -> Result<Vec<u8>, AppError> {
+    fn dump(&self, protocol: LoginProtocol) -> Result<Vec<u8>, AppError> {
         #[derive(Serialize)]
-        struct LoginPayload<'a> {
+        struct LoginPayloadV1<'a> {
             #[serde(rename = "deviceId", skip_serializing_if = "Option::is_none")]
             device_id: Option<&'a str>,
             credential: &'a str,
@@ -114,17 +115,32 @@ impl SekaiAccount for SekaiAccountCP {
             auth_trigger_type: &'static str,
         }
 
-        let payload = LoginPayload {
-            device_id: if self.device_id.is_empty() {
-                None
-            } else {
-                Some(&self.device_id)
-            },
-            credential: &self.credential,
-            auth_trigger_type: "normal",
-        };
+        #[derive(Serialize)]
+        struct LoginPayloadV2<'a> {
+            #[serde(rename = "accessToken")]
+            access_token: &'a str,
+        }
 
-        rmp_serde::to_vec_named(&payload).map_err(|e| AppError::ParseError(e.to_string()))
+        match protocol {
+            LoginProtocol::V1 => {
+                let payload = LoginPayloadV1 {
+                    device_id: if self.device_id.is_empty() {
+                        None
+                    } else {
+                        Some(&self.device_id)
+                    },
+                    credential: &self.credential,
+                    auth_trigger_type: "normal",
+                };
+                rmp_serde::to_vec_named(&payload).map_err(|e| AppError::ParseError(e.to_string()))
+            }
+            LoginProtocol::V2 => {
+                let payload = LoginPayloadV2 {
+                    access_token: &self.credential,
+                };
+                rmp_serde::to_vec_named(&payload).map_err(|e| AppError::ParseError(e.to_string()))
+            }
+        }
     }
 }
 
@@ -174,9 +190,9 @@ impl SekaiAccount for SekaiAccountNuverse {
         &self.proxy_roles
     }
 
-    fn dump(&self) -> Result<Vec<u8>, AppError> {
+    fn dump(&self, protocol: LoginProtocol) -> Result<Vec<u8>, AppError> {
         #[derive(Serialize)]
-        struct LoginPayload<'a> {
+        struct LoginPayloadV1<'a> {
             #[serde(rename = "deviceId", skip_serializing_if = "Option::is_none")]
             device_id: Option<&'a str>,
             #[serde(rename = "accessToken")]
@@ -185,24 +201,40 @@ impl SekaiAccount for SekaiAccountNuverse {
             user_id: i64,
         }
 
-        let user_id_num: i64 = self
-            .user_id
-            .parse()
-            .map_err(|_| AppError::ParseError(format!("Invalid user_id: {}", self.user_id)))?;
+        #[derive(Serialize)]
+        struct LoginPayloadV2<'a> {
+            #[serde(rename = "accessToken")]
+            access_token: &'a str,
+        }
 
-        let fallback_device_id = if self.device_id.is_empty() {
-            Some(self.user_id.as_str())
-        } else {
-            Some(self.device_id.as_str())
-        };
+        match protocol {
+            LoginProtocol::V1 => {
+                let user_id_num: i64 = self.user_id.parse().map_err(|_| {
+                    AppError::ParseError(format!("Invalid user_id: {}", self.user_id))
+                })?;
 
-        let payload = LoginPayload {
-            device_id: fallback_device_id,
-            access_token: &self.access_token,
-            user_id: user_id_num,
-        };
+                let fallback_device_id = if self.device_id.is_empty() {
+                    Some(self.user_id.as_str())
+                } else {
+                    Some(self.device_id.as_str())
+                };
 
-        rmp_serde::to_vec_named(&payload).map_err(|e| AppError::ParseError(e.to_string()))
+                let payload = LoginPayloadV1 {
+                    device_id: fallback_device_id,
+                    access_token: &self.access_token,
+                    user_id: user_id_num,
+                };
+                rmp_serde::to_vec_named(&payload).map_err(|e| AppError::ParseError(e.to_string()))
+            }
+            // 6.4.0 sends only the access token; the server derives the account
+            // and device from the GSDK JWT itself.
+            LoginProtocol::V2 => {
+                let payload = LoginPayloadV2 {
+                    access_token: &self.access_token,
+                };
+                rmp_serde::to_vec_named(&payload).map_err(|e| AppError::ParseError(e.to_string()))
+            }
+        }
     }
 }
 
@@ -248,10 +280,10 @@ impl SekaiAccount for AccountType {
         }
     }
 
-    fn dump(&self) -> Result<Vec<u8>, AppError> {
+    fn dump(&self, protocol: LoginProtocol) -> Result<Vec<u8>, AppError> {
         match self {
-            AccountType::CP(a) => a.dump(),
-            AccountType::Nuverse(a) => a.dump(),
+            AccountType::CP(a) => a.dump(protocol),
+            AccountType::Nuverse(a) => a.dump(protocol),
         }
     }
 }
@@ -288,5 +320,70 @@ mod tests {
 
         assert!(account.has_proxy_role(MYSEKAI_PROXY_ROLE));
         assert!(!account.has_proxy_role(DEFAULT_PROXY_ROLE));
+    }
+
+    /// Decodes a msgpack map's keys, so the tests assert on the wire shape
+    /// rather than on a serialized byte string that shifts with field order.
+    fn msgpack_keys(data: &[u8]) -> Vec<String> {
+        let value = rmpv::decode::read_value(&mut std::io::Cursor::new(data)).unwrap();
+        value
+            .as_map()
+            .expect("login body must be a map")
+            .iter()
+            .map(|(k, _)| k.as_str().expect("keys must be strings").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn v2_login_body_carries_only_access_token() {
+        let cp = SekaiAccountCP {
+            user_id: "1".to_string(),
+            device_id: "device".to_string(),
+            credential: "cred".to_string(),
+            proxy_roles: vec![],
+        };
+        assert_eq!(
+            msgpack_keys(&cp.dump(LoginProtocol::V2).unwrap()),
+            ["accessToken"]
+        );
+
+        let nuverse = SekaiAccountNuverse {
+            user_id: "123".to_string(),
+            device_id: "device".to_string(),
+            access_token: "token".to_string(),
+            proxy_roles: vec![],
+        };
+        assert_eq!(
+            msgpack_keys(&nuverse.dump(LoginProtocol::V2).unwrap()),
+            ["accessToken"]
+        );
+    }
+
+    #[test]
+    fn v1_login_body_keeps_legacy_fields() {
+        let nuverse = SekaiAccountNuverse {
+            user_id: "123".to_string(),
+            device_id: "device".to_string(),
+            access_token: "token".to_string(),
+            proxy_roles: vec![],
+        };
+        let keys = msgpack_keys(&nuverse.dump(LoginProtocol::V1).unwrap());
+        assert!(keys.contains(&"accessToken".to_string()));
+        assert!(keys.contains(&"userID".to_string()));
+        assert!(keys.contains(&"deviceId".to_string()));
+    }
+
+    #[test]
+    fn v2_does_not_require_a_numeric_user_id() {
+        // v1 parses user_id as i64; v2 must not, so accounts whose id is not a
+        // plain integer still log in.
+        let nuverse = SekaiAccountNuverse {
+            user_id: "not-a-number".to_string(),
+            device_id: String::new(),
+            access_token: "token".to_string(),
+            proxy_roles: vec![],
+        };
+        assert!(nuverse.dump(LoginProtocol::V1).is_err());
+        assert!(nuverse.dump(LoginProtocol::V2).is_ok());
     }
 }

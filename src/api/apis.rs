@@ -373,7 +373,7 @@ pub async fn get_event_ranking_border(
     if !event_id.chars().all(|c| c.is_ascii_digit()) {
         return Err(AppError::ParseError("event_id must be numeric".to_string()));
     }
-    let path = format!("/event/{}/ranking-border", event_id);
+    let path = format!("/user/{{userId}}/event/{}/ranking-border", event_id);
     let mut resp = proxy_game_api(&state, &server, &path).await?;
 
     // Nuverse servers (TW/KR/CN) return userCard as a flat array; restore to keyed dict
