@@ -366,6 +366,15 @@ async fn get_custom_music_score_resource(
     })
 }
 
+fn event_ranking_border_path(region: ServerRegion, event_id: &str) -> String {
+    // JP serves borders on the event route. The user-scoped route returns 500.
+    // Keep the existing routes for other regions, including EN pending its own fix.
+    match region {
+        ServerRegion::Jp => format!("/event/{}/ranking-border", event_id),
+        _ => format!("/user/{{userId}}/event/{}/ranking-border", event_id),
+    }
+}
+
 pub async fn get_event_ranking_border(
     State(state): State<Arc<AppState>>,
     Path((server, event_id)): Path<(String, String)>,
@@ -373,16 +382,48 @@ pub async fn get_event_ranking_border(
     if !event_id.chars().all(|c| c.is_ascii_digit()) {
         return Err(AppError::ParseError("event_id must be numeric".to_string()));
     }
-    let path = format!("/user/{{userId}}/event/{}/ranking-border", event_id);
-    let mut resp = proxy_game_api(&state, &server, &path).await?;
-
-    // Nuverse servers (TW/KR/CN) return userCard as a flat array; restore to keyed dict
     let region: ServerRegion = server
         .parse()
         .map_err(|_| AppError::InvalidServerRegion(server.to_string()))?;
+    let path = event_ranking_border_path(region, &event_id);
+    let mut resp = proxy_game_api(&state, &server, &path).await?;
+
+    // Nuverse servers (TW/KR/CN) return userCard as a flat array; restore to keyed dict
     if !region.is_cp_server() {
         crate::client::nuverse::restore_ranking_user_cards(&mut resp.body);
     }
 
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::event_ranking_border_path;
+    use crate::config::ServerRegion;
+
+    #[test]
+    fn jp_border_uses_event_route() {
+        // Verified with JP E219: event route = 200; user-scoped route = 500.
+        assert_eq!(
+            event_ranking_border_path(ServerRegion::Jp, "219"),
+            "/event/219/ranking-border"
+        );
+    }
+
+    #[test]
+    fn other_regions_keep_user_scoped_border_routes() {
+        for region in [
+            ServerRegion::Cn,
+            ServerRegion::Tw,
+            ServerRegion::Kr,
+            ServerRegion::En,
+        ] {
+            assert_eq!(
+                event_ranking_border_path(region, "181"),
+                "/user/{userId}/event/181/ranking-border",
+                "unexpected route change for {}",
+                region.as_str()
+            );
+        }
+    }
 }
