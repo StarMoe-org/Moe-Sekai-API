@@ -367,11 +367,12 @@ async fn get_custom_music_score_resource(
 }
 
 fn event_ranking_border_path(region: ServerRegion, event_id: &str) -> String {
-    // JP serves borders on the event route. The user-scoped route returns 500.
-    // Keep the existing routes for other regions, including EN pending its own fix.
+    // JP/EN serve borders on the event route; Nuverse uses the user-scoped route.
     match region {
-        ServerRegion::Jp => format!("/event/{}/ranking-border", event_id),
-        _ => format!("/user/{{userId}}/event/{}/ranking-border", event_id),
+        ServerRegion::Jp | ServerRegion::En => format!("/event/{}/ranking-border", event_id),
+        ServerRegion::Cn | ServerRegion::Tw | ServerRegion::Kr => {
+            format!("/user/{{userId}}/event/{}/ranking-border", event_id)
+        }
     }
 }
 
@@ -411,13 +412,17 @@ mod tests {
     }
 
     #[test]
-    fn other_regions_keep_user_scoped_border_routes() {
-        for region in [
-            ServerRegion::Cn,
-            ServerRegion::Tw,
-            ServerRegion::Kr,
-            ServerRegion::En,
-        ] {
+    fn en_border_uses_event_route() {
+        // Verified with EN E181: event route = 200; user-scoped route = 404.
+        assert_eq!(
+            event_ranking_border_path(ServerRegion::En, "181"),
+            "/event/181/ranking-border"
+        );
+    }
+
+    #[test]
+    fn nuverse_regions_keep_user_scoped_border_routes() {
+        for region in [ServerRegion::Cn, ServerRegion::Tw, ServerRegion::Kr] {
             assert_eq!(
                 event_ranking_border_path(region, "181"),
                 "/user/{userId}/event/181/ranking-border",
