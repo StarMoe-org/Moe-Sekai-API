@@ -40,6 +40,24 @@ pub struct SekaiClient {
     session_index: AtomicUsize,
     reload_lock: Arc<tokio::sync::Mutex<()>>,
     recovery_started: Arc<AtomicBool>,
+    login_status: Arc<RwLock<RegionLoginStatus>>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RegionLoginStatus {
+    pub last_login_ok_at: Option<i64>,
+    pub last_login_error: Option<String>,
+    pub last_login_error_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RegionHealth {
+    pub enabled: bool,
+    pub active_sessions: usize,
+    pub proxy_configured: bool,
+    pub last_login_ok_at: Option<i64>,
+    pub last_login_error: Option<String>,
+    pub last_login_error_at: Option<i64>,
 }
 
 struct RecoveryFlagGuard {
@@ -64,7 +82,24 @@ struct ParsedAccounts {
 }
 
 const INITIAL_RECOVERY_DELAY: Duration = Duration::from_secs(5);
-const MAX_RECOVERY_DELAY: Duration = Duration::from_secs(300);
+const MAX_RECOVERY_DELAY: Duration = Duration::from_secs(45);
+
+fn unix_timestamp_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn truncate_error_message(msg: &str, max_chars: usize) -> String {
+    let mut chars = msg.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", truncated)
+    } else {
+        truncated
+    }
+}
 
 fn next_recovery_delay(current: Duration) -> Duration {
     current.saturating_mul(2).min(MAX_RECOVERY_DELAY)
@@ -163,6 +198,7 @@ impl SekaiClient {
             session_index: AtomicUsize::new(0),
             reload_lock: Arc::new(tokio::sync::Mutex::new(())),
             recovery_started: Arc::new(AtomicBool::new(false)),
+            login_status: Arc::new(RwLock::new(RegionLoginStatus::default())),
         };
         Ok(client)
     }
@@ -423,6 +459,34 @@ impl SekaiClient {
 
     pub fn session_count(&self) -> usize {
         self.sessions.read().len()
+    }
+
+    pub fn health_snapshot(&self) -> RegionHealth {
+        let status = self.login_status.read().clone();
+        RegionHealth {
+            enabled: self.config.enabled,
+            active_sessions: self.session_count(),
+            proxy_configured: self
+                .proxy
+                .as_deref()
+                .map(|p| !p.trim().is_empty())
+                .unwrap_or(false),
+            last_login_ok_at: status.last_login_ok_at,
+            last_login_error: status.last_login_error,
+            last_login_error_at: status.last_login_error_at,
+        }
+    }
+
+    fn record_login_success(&self) {
+        let mut status = self.login_status.write();
+        status.last_login_ok_at = Some(unix_timestamp_secs());
+        status.last_login_error = None;
+    }
+
+    fn record_login_failure(&self, err: &AppError) {
+        let mut status = self.login_status.write();
+        status.last_login_error = Some(truncate_error_message(&err.to_string(), 512));
+        status.last_login_error_at = Some(unix_timestamp_secs());
     }
 
     pub fn start_empty_pool_recovery(self: &Arc<Self>) {
@@ -919,38 +983,7 @@ impl SekaiClient {
             .await
             .map_err(|e| AppError::NetworkError(e.to_string()))?;
 
-        if content_type.contains("octet-stream") || content_type.contains("binary") {
-            let sekai_status = SekaiHttpStatus::from_code(status)?;
-            match sekai_status {
-                SekaiHttpStatus::Ok
-                | SekaiHttpStatus::ClientError
-                | SekaiHttpStatus::NotFound
-                | SekaiHttpStatus::Conflict => self.cryptor.unpack(&body),
-                SekaiHttpStatus::SessionError => Err(AppError::SessionError),
-                SekaiHttpStatus::GameUpgrade => Err(AppError::UpgradeRequired),
-                SekaiHttpStatus::UnderMaintenance => Err(AppError::UnderMaintenance),
-                _ => Err(AppError::Unknown {
-                    status,
-                    body: String::from_utf8_lossy(&body).to_string(),
-                }),
-            }
-        } else {
-            let sekai_status = SekaiHttpStatus::from_code(status)?;
-            match sekai_status {
-                SekaiHttpStatus::UnderMaintenance => Err(AppError::UnderMaintenance),
-                SekaiHttpStatus::ServerError => Err(AppError::Unknown {
-                    status,
-                    body: String::from_utf8_lossy(&body).to_string(),
-                }),
-                SekaiHttpStatus::SessionError if content_type.contains("xml") => {
-                    Err(AppError::CookieExpired)
-                }
-                _ => Err(AppError::Unknown {
-                    status,
-                    body: String::from_utf8_lossy(&body).to_string(),
-                }),
-            }
-        }
+        decode_response_with_cryptor(&self.cryptor, status, &content_type, &body)
     }
 
     pub async fn handle_response_ordered(
@@ -1049,6 +1082,19 @@ impl SekaiClient {
     }
 
     pub async fn login(&self, session: &AccountSession) -> Result<LoginResponse, AppError> {
+        match self.login_inner(session).await {
+            Ok(resp) => {
+                self.record_login_success();
+                Ok(resp)
+            }
+            Err(err) => {
+                self.record_login_failure(&err);
+                Err(err)
+            }
+        }
+    }
+
+    async fn login_inner(&self, session: &AccountSession) -> Result<LoginResponse, AppError> {
         let payload = session.dump_account(self.config.login_protocol)?;
         let encrypted = self.cryptor.pack_bytes(&payload)?;
         let (url, method) = if self.region.is_cp_server() {
@@ -1062,16 +1108,43 @@ impl SekaiClient {
             let url = format!("{}/api/user/auth", self.config.api_url);
             (url, reqwest::Method::POST)
         };
-        let mut req = self.prepare_request(session, method, &url);
-        req = req
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .header(reqwest::header::ACCEPT, "application/octet-stream");
-        req = req.body(encrypted);
         info!("Account #{} logging in...", session.user_id());
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| AppError::NetworkError(e.to_string()))?;
+        let mut resp = None;
+        let mut last_send_err = None;
+        for attempt in 1..=2 {
+            let mut req = self.prepare_request(session, method.clone(), &url);
+            req = req
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .header(reqwest::header::ACCEPT, "application/octet-stream")
+                .body(encrypted.clone());
+            match req.send().await {
+                Ok(r) => {
+                    resp = Some(r);
+                    break;
+                }
+                Err(e) => {
+                    if attempt == 1 {
+                        warn!(
+                            "Account #{} login transport error (retrying once): {}",
+                            session.user_id(),
+                            e
+                        );
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    last_send_err = Some(e);
+                }
+            }
+        }
+        let resp = match resp {
+            Some(r) => r,
+            None => {
+                return Err(AppError::NetworkError(
+                    last_send_err
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "Login request failed".to_string()),
+                ));
+            }
+        };
         self.update_session_token(session, &resp);
         let login_resp: LoginResponse = self.handle_response(resp).await?;
         if !login_resp.session_token.is_empty() {
@@ -1442,15 +1515,67 @@ pub struct UserRegistration {
     pub user_id: String,
 }
 
+fn decode_encrypted_error_body(cryptor: &SekaiCryptor, body: &[u8]) -> String {
+    match cryptor.unpack_value(body) {
+        Ok(value) => sonic_rs::to_string(&value).unwrap_or_else(|_| value.to_string()),
+        Err(err) => format!(
+            "undecrypted({} bytes, {}): {}",
+            body.len(),
+            err,
+            String::from_utf8_lossy(body)
+        ),
+    }
+}
+
+fn decode_response_with_cryptor<T: DeserializeOwned>(
+    cryptor: &SekaiCryptor,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> Result<T, AppError> {
+    let ct = content_type.to_ascii_lowercase();
+    let sekai_status = SekaiHttpStatus::from_code(status)?;
+    if ct.contains("octet-stream") || ct.contains("binary") {
+        match sekai_status {
+            SekaiHttpStatus::Ok
+            | SekaiHttpStatus::ClientError
+            | SekaiHttpStatus::NotFound
+            | SekaiHttpStatus::Conflict => cryptor.unpack(body),
+            SekaiHttpStatus::SessionError => Err(AppError::SessionError),
+            SekaiHttpStatus::GameUpgrade => Err(AppError::UpgradeRequired),
+            SekaiHttpStatus::UnderMaintenance => Err(AppError::UnderMaintenance),
+            SekaiHttpStatus::ServerError => Err(AppError::Unknown {
+                status,
+                body: decode_encrypted_error_body(cryptor, body),
+            }),
+        }
+    } else {
+        match sekai_status {
+            SekaiHttpStatus::UnderMaintenance => Err(AppError::UnderMaintenance),
+            SekaiHttpStatus::ServerError => Err(AppError::Unknown {
+                status,
+                body: String::from_utf8_lossy(body).to_string(),
+            }),
+            SekaiHttpStatus::SessionError if ct.contains("xml") => Err(AppError::CookieExpired),
+            _ => Err(AppError::Unknown {
+                status,
+                body: String::from_utf8_lossy(body).to_string(),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        next_recovery_delay, replace_session_pool, should_wait_for_complete_parse,
-        try_claim_recovery, RecoveryFlagGuard, SekaiClient, SessionPoolReplacement,
-        INITIAL_RECOVERY_DELAY, MAX_RECOVERY_DELAY,
+        decode_response_with_cryptor, next_recovery_delay, replace_session_pool,
+        should_wait_for_complete_parse, try_claim_recovery, RecoveryFlagGuard, SekaiClient,
+        SessionPoolReplacement, INITIAL_RECOVERY_DELAY, MAX_RECOVERY_DELAY,
     };
     use crate::client::account::{AccountType, SekaiAccountCP, DEFAULT_PROXY_ROLE};
     use crate::client::session::AccountSession;
+    use crate::crypto::SekaiCryptor;
+    use crate::error::AppError;
     use base64::Engine as _;
     use flate2::{write::GzEncoder, Compression};
     use parking_lot::RwLock;
@@ -1559,5 +1684,65 @@ mod tests {
 
         assert!(try_claim_recovery(&flag));
         assert!(!try_claim_recovery(&flag));
+    }
+
+    #[test]
+    fn recovery_max_delay_is_45_seconds() {
+        assert_eq!(MAX_RECOVERY_DELAY.as_secs(), 45);
+    }
+
+    #[test]
+    fn handle_response_decrypts_encrypted_500_payload() {
+        let cryptor = SekaiCryptor::from_hex(
+            "00112233445566778899aabbccddeeff",
+            "ffeeddccbbaa99887766554433221100",
+        )
+        .unwrap();
+        let payload = serde_json::json!({
+            "errorCode": "session_or_ip_rejected",
+            "result": "failed"
+        });
+        let encrypted = cryptor.pack(&payload).unwrap();
+
+        let err = decode_response_with_cryptor::<serde_json::Value>(
+            &cryptor,
+            500,
+            "application/octet-stream",
+            &encrypted,
+        )
+        .unwrap_err();
+
+        match err {
+            AppError::Unknown { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("session_or_ip_rejected"));
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn handle_response_handles_undecryptable_500_payload() {
+        let cryptor = SekaiCryptor::from_hex(
+            "00112233445566778899aabbccddeeff",
+            "ffeeddccbbaa99887766554433221100",
+        )
+        .unwrap();
+
+        let err = decode_response_with_cryptor::<serde_json::Value>(
+            &cryptor,
+            500,
+            "application/octet-stream",
+            b"not-valid-aes",
+        )
+        .unwrap_err();
+
+        match err {
+            AppError::Unknown { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("undecrypted"));
+            }
+            other => panic!("unexpected error: {:?}", other),
+        }
     }
 }

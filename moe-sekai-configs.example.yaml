@@ -1,4 +1,10 @@
 proxy: ""
+# Optional directory of per-region YAML overrides (<region>.yaml / <region>.yml).
+# If omitted, <config_dir>/servers.d is loaded automatically when present.
+# Can also be overridden via SERVERS_CONFIG_DIR.
+# Supported env overrides: PORT, PROXY, PROXY_<REGION>, LOGIN_PROTOCOL_<REGION>,
+# SERVER_ENABLED_<REGION>, SEKAI_USER_JWT_SIGNING_KEY, DATABASE_DSN, REDIS_PASSWORD.
+servers_dir: ""
 jp_sekai_cookie_url: "<replace-if-needed>"
 
 git:

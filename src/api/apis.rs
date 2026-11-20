@@ -173,6 +173,27 @@ pub async fn get_information(
     proxy_game_api(&state, &server, "/information").await
 }
 
+pub async fn post_reload_accounts(
+    State(state): State<Arc<AppState>>,
+    Path(server): Path<String>,
+) -> Result<ApiResponse, AppError> {
+    let client = get_client(&state, &server)?;
+    client.reload_accounts().await?;
+    if client.session_count() == 0 {
+        client.start_empty_pool_recovery();
+    }
+    let health = client.health_snapshot();
+    Ok(ApiResponse {
+        status: StatusCode::OK,
+        body: json!({
+            "result": "ok",
+            "server": client.region.as_str(),
+            "active_sessions": health.active_sessions,
+            "health": health,
+        }),
+    })
+}
+
 pub async fn post_mysekai_room(
     State(state): State<Arc<AppState>>,
     Path((server, target_user_id)): Path<(String, String)>,

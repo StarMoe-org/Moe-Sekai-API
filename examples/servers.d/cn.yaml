@@ -1,0 +1,30 @@
+enabled: false
+api_url: ""
+require_cookies: false
+login_protocol: "v2"
+headers:
+  Host: ""
+  User-Agent: "<replace-if-needed>"
+  Accept-Encoding: "deflate, gzip"
+  Content-Type: "application/octet-stream"
+  Accept: "application/octet-stream"
+  X-Install-Id: "<replace-if-needed>"
+  X-CHANNEL-OP: "<replace-if-needed>"
+  X-Platform: "Android"
+  device_id: "<replace-if-needed>"
+  X-DeviceModel: "<replace-if-needed>"
+  X-OperatingSystem: "<replace-if-needed>"
+  X-Unity-Version: "<replace-if-needed>"
+aes_key_hex: ""
+aes_iv_hex: ""
+account_dir: "/data/accounts/cn"
+master_dir: "/data/master/cn"
+version_path: "/data/versions/cn.json"
+nuverse_master_data_url: ""
+nuverse_structure_file_path: ""
+enable_master_updater: false
+master_updater_cron: "7 * * * * *"
+enable_app_hash_updater: false
+app_hash_updater_cron: "30 * * * * *"
+remote_version_url: ""
+proxy: "http://vpngate-cn.vpngate-proxy.svc.cluster.local:8888"

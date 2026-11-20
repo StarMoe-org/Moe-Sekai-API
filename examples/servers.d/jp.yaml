@@ -1,0 +1,20 @@
+enabled: false
+api_url: ""
+require_cookies: true
+login_protocol: "v1"
+headers:
+  Host: ""
+aes_key_hex: ""
+aes_iv_hex: ""
+account_dir: "/data/accounts/jp"
+master_dir: "/data/master/jp"
+version_path: "/data/versions/jp.json"
+nuverse_master_data_url: ""
+nuverse_structure_file_path: ""
+enable_master_updater: false
+master_updater_cron: "7 * * * * *"
+enable_app_hash_updater: false
+app_hash_updater_cron: "30 * * * * *"
+remote_version_url: ""
+# Set empty string to force direct egress even when global proxy is configured.
+proxy: ""
